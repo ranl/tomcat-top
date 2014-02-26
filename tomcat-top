@@ -1,0 +1,324 @@
+#!/usr/bin/env python
+
+"""
+Get Run-Time information from Apache Tomcat using tomcat manager
+"""
+
+# Python Libs
+import urllib2
+import curses
+import time
+import atexit
+import xml.etree.ElementTree as ET
+from collections import defaultdict
+from optparse import OptionParser
+
+
+def parse_cli():
+    """
+    Parse options from the shell
+    """
+
+    valid = True
+    parser = OptionParser(
+        usage='%prog [options]',
+        description='Apache Tomcat Top'
+    )
+    parser.add_option(
+        '-u', '--url', dest='url', type='string', help='Manager URL', default='http://localhost:8080/manager'
+    )
+    parser.add_option(
+        '-i', '--interval', dest='interval', type='int', help='update interval in seconds', default=1
+    )
+    parser.add_option(
+        '-t', '--timeout', dest='timeout', type='int', help='http timeout', default=5
+    )
+    parser.add_option(
+        '--user', dest='user', type='string', help='http username', default=None
+    )
+    parser.add_option(
+        '--passwd', dest='passwd', type='string', help='http password', default=None
+    )
+    parser.add_option(
+        '--realm', dest='realm', type='string', help='http authentication realm', default='Tomcat Manager Application'
+    )
+    parser.add_option(
+        '-p', '--proto', dest='protocol', type='string', help='protocol to get [ajp|http]', default='ajp'
+    )
+    (opts, args) = parser.parse_args()
+
+    if len(args) != 0:
+        print 'unknown arguments: {0}'.format(args)
+        valid = False
+    elif not opts.user and opts.passwd:
+        print 'missing --user'
+        valid = False
+    elif opts.user and not opts.passwd:
+        print 'missing --passwd'
+        valid = False
+    elif opts.protocol not in ['ajp', 'http']:
+        print 'invalid protocol "{0}"'.format(opts.protocol)
+        valid = False
+
+    if not valid:
+        parser.print_help()
+        exit(1)
+
+    return opts
+
+
+def sort_requests(requests, field='requestProcessingTime', ftype=int, rev=False):
+    """
+    Sort the requests list by a specific field
+    """
+
+    return sorted(requests, key=lambda req: ftype(req[field]), reverse=rev)
+
+
+class TomcatManager():
+
+    def __init__(self, url, user=None, passwd=None, realm='Tomcat Manager Application', timeout=5):
+        self.url = url.strip()
+        if self.url[-1] == '/':
+            self.url = self.url[:-1]
+        self.timeout = timeout
+
+        if user and passwd:
+            self.install_auth(user, passwd, realm)
+
+        self.xml = None
+
+    def install_auth(self, user, passwd, realm):
+        """
+        Install Authentication handler
+        """
+        basic = urllib2.HTTPBasicAuthHandler()
+        basic.add_password(
+            realm=realm, uri=self.url, user=user, passwd=passwd
+        )
+        digest = urllib2.HTTPDigestAuthHandler()
+        digest.add_password(
+            realm=realm, uri=self.url, user=user, passwd=passwd
+        )
+        urllib2.install_opener(
+            urllib2.build_opener(basic, digest)
+        )
+
+    def update(self):
+        """
+        fetch data from manager
+        """
+
+        self.xml = ET.fromstring(
+            urllib2.urlopen(self.url + '/status?XML=true').read()
+        )
+
+    def thread_status(self, protocol='ajp'):
+        """
+        Get Statistics about the running threads
+        """
+
+        ret = {
+            'threads': {
+                'P': 0,
+                'S': 0,
+                'F': 0,
+                'R': 0,
+                'K': 0,
+            },
+            'active': 0,
+            'requests': [],
+            'urls': defaultdict(int),
+            'clients': defaultdict(int),
+            'req_summary': {},
+            'thread_summary': {},
+            'proc_avg': 0
+        }
+
+        for connector in self.xml.findall('connector'):
+            if connector.attrib['name'].startswith('"'+protocol+'-'):
+                ret['req_summary'] = connector.find('requestInfo').attrib
+                ret['thread_summary'] = connector.find('threadInfo').attrib
+
+                for worker in connector.find('workers').findall('worker'):
+                    ret['threads'][worker.attrib['stage']] += 1
+                    if worker.attrib['stage'] == 'S' or worker.attrib['stage'] == 'P':
+                        ret['urls'][worker.attrib['currentUri']] += 1
+                        ret['clients'][worker.attrib['remoteAddr']] += 1
+                        ret['active'] += 1
+                        ret['requests'].append(worker.attrib)
+                        ret['proc_avg'] += int(worker.attrib['requestProcessingTime'])
+                if ret['active']:
+                    ret['proc_avg'] = ret['proc_avg'] / ret['active']
+
+        return ret
+
+    def get_mem(self):
+        return self.xml.find('jvm').find('memory').attrib
+
+
+class TomcatTop():
+
+    def __init__(self, url, user, passwd, realm, timeout, interval, protocol):
+        self.screen = None
+        self.protocol = protocol
+        self.interval = interval
+        self.manager = TomcatManager(
+            url, user, passwd, realm, timeout
+        )
+        self.maxx = None
+        self.maxy = None
+        self.data = None
+
+    def __call__(self, screen):
+        self.main(screen)
+
+    def print_requests(self, offset):
+        header = '{0}\t{1}\t\t{2}\t{3}\t{4}'.format(
+            'Time',
+            'Client',
+            'BSent',
+            'BRec',
+            'URL'
+        )
+        self.screen.addstr(
+            offset, 2, header
+        )
+        offset += 1
+        self.screen.addstr(
+            offset, 1, '-----------------------------------------------------------'
+        )
+        offset += 1
+        for req in sort_requests(self.data['requests'], rev=True):
+            if req['currentQueryString'] == '?':
+                req['currentQueryString'] = ''
+            else:
+                req['currentQueryString'] = '?' + req['currentQueryString']
+            self.screen.addstr(
+                offset, 2, '{0}\t{1}\t{2}\t{3}\t{4}{5}'.format(
+                    int(req['requestProcessingTime'])/1000,
+                    req['remoteAddr'],
+                    req['requestBytesSent'],
+                    req['requestBytesReceived'],
+                    req['currentUri'],
+                    req['currentQueryString']
+                )
+            )
+            offset += 1
+
+        return offset
+
+    def print_threads(self, offset):
+        self.screen.addstr(
+            offset, 1, ' Threads ({0})'.format(self.data['active'])
+        )
+        offset += 1
+        self.screen.addstr(
+            offset, 1, '---------------' + ('-' * len(str(self.data['active'])))
+        )
+        offset += 1
+        for stage in self.data['threads']:
+            self.screen.addstr(
+                offset, 2, '{0}\t{1}'.format(stage, self.data['threads'][stage])
+            )
+            offset += 1
+        return offset
+
+    def print_top_urls(self, offset):
+        self.screen.addstr(
+            offset, 1, ' Top Urls '
+        )
+        offset += 1
+        self.screen.addstr(
+            offset, 1, '---------------'
+        )
+        offset += 1
+        for url in sorted(self.data['urls'], key=self.data['urls'].get, reverse=True):
+            self.screen.addstr(
+                offset, 2, '{0}\t{1}'.format(self.data['urls'][url], url)
+            )
+            offset += 1
+        return offset
+
+    def print_top_clients(self, offset):
+        x = 70
+        self.screen.addstr(
+            offset, x, ' Top Clients '
+        )
+        offset += 1
+        self.screen.addstr(
+            offset, x, '---------------'
+        )
+        offset += 1
+        for client in sorted(self.data['clients'], key=self.data['clients'].get, reverse=True):
+            self.screen.addstr(
+                offset, x, '{0}\t{1}'.format(self.data['clients'][client], client)
+            )
+            offset += 1
+        return offset
+
+    def print_stats(self, offset):
+        x = len(str(self.data['active'])) + 5 + 14
+        mem = self.manager.get_mem()
+        self.screen.addstr(
+            offset, x, ' Stats'
+        )
+        offset += 1
+        self.screen.addstr(
+            offset, x, '-----------------------------------'
+        )
+        offset += 1
+        self.screen.addstr(
+            offset, x+1, 'Active Threads:\t{0}'.format(self.data['active'])
+        )
+        offset += 1
+        self.screen.addstr(
+            offset, x+1, 'Avg Processing:\t{0}sec'.format(self.data['proc_avg']/1000)
+        )
+        offset += 1
+        self.screen.addstr(
+            offset, x+1, 'Memory Usage:\t{0}mb / {1}mb'.format(int(mem['total']) / (1024*1024), int(mem['free']) / (1024*1024))
+        )
+        offset += 1
+        self.screen.addstr(
+            offset, x+1, 'Current Time:\t{0}'.format(time.strftime("%H:%M:%S"))
+        )
+
+        return offset
+
+    def main(self, screen):
+        self.screen = screen
+        while True:
+            try:
+                self.manager.update()
+            except urllib2.URLError:
+                time.sleep(self.interval)
+                continue
+            self.data = self.manager.thread_status(self.protocol)
+
+            self.screen.clear()
+            self.screen.border(0)
+            self.maxy, self.maxx = self.screen.getmaxyx()
+
+            try:
+                line = self.print_stats(1)
+                line = max(self.print_threads(1), line)
+                line = max(self.print_top_clients(1), line)
+                line = self.print_top_urls(line+1)
+                line = self.print_requests(line+1)
+            except curses.error:
+                pass
+
+            self.screen.refresh()
+            time.sleep(self.interval)
+
+
+if __name__ == '__main__':
+    opts = parse_cli()
+    tomcat_top = TomcatTop(
+        opts.url, opts.user, opts.passwd, opts.realm, opts.timeout, opts.interval, opts.protocol
+    )
+    try:
+        curses.wrapper(tomcat_top)
+    except KeyboardInterrupt:
+        pass
